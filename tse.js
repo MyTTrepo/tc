@@ -14,7 +14,7 @@ const storage = (function () {
   let instance;
   
   if (isNode) {
-    const { existsSync, mkdirSync, readFileSync, writeFileSync, statSync } = require('fs');
+    const { existsSync, mkdirSync, readFileSync, writeFileSync, statSync, readdirSync } = require('fs');
     const { join } = require('path');
     const { gzipSync, gunzipSync } = require('zlib');
     
@@ -31,44 +31,83 @@ const storage = (function () {
       writeFileSync(pathfile, datadir);
     }
     
-    const store = Object.create(null);
-    
     const getItem = (key) => {
       key = key.replace('tse.', '');
-      const file = join(datadir, `${key}.csv`);
+      const dir = key.startsWith('prices.') ? join(datadir, 'prices') : datadir;
+      const file = join(dir, `${key}.csv`);
       if ( !existsSync(file) ) writeFileSync(file, '');
-      if ( !(key in store) ) store[key] = readFileSync(file, 'utf8');
-      return store[key];
+      return readFileSync(file, 'utf8');
     };
     
     const setItem = (key, value) => {
       key = key.replace('tse.', '');
-      store[key] = value;
-      writeFileSync(join(datadir, `${key}.csv`), value);
+      const dir = key.startsWith('prices.') ? join(datadir, 'prices') : datadir;
+      writeFileSync(join(dir, `${key}.csv`), value);
     };
     
     const getItemAsync = (key, zip=false) => new Promise((done, fail) => {
       key = key.replace('tse.', '');
-      const file = join(datadir, `${key}.csv` + (zip?'.gz':''));
-      if ( !existsSync(file) ) { done(''); return; };
-      if ( !(key in store) ) {
-        const content = readFileSync(file, zip?undefined:'utf8');
-        store[key] = zip ? gunzipSync(content).toString() : content;
+      const dir = key.startsWith('prices.') ? join(datadir, 'prices') : datadir;
+      const file = join(dir, `${key}.csv` + (zip?'.gz':''));
+      if ( !existsSync(file) ) {
+        writeFileSync(file, '');
+        done('');
+        return;
       }
-      done(store[key]);
+      const content = readFileSync(file, zip?undefined:'utf8');
+      done(zip ? gunzipSync(content).toString() : content);
     });
     
     const setItemAsync = (key, value, zip=false) => new Promise((done, fail) => {
       key = key.replace('tse.', '');
-      store[key] = value;
-      const file = join(datadir, `${key}.csv` + (zip?'.gz':''));
+      let dir = datadir;
+      if ( key.startsWith('prices.') ) {
+        dir = join(datadir, 'prices');
+        key = key.replace('prices.', '');
+      }
+      const file = join(dir, `${key}.csv` + (zip?'.gz':''));
       writeFileSync(file, zip ? gzipSync(value) : value);
       done();
     });
     
+    const getItems = async function (selins=new Set(), result={}) {
+      const d = join(datadir, 'prices');
+      if (!existsSync(d)) mkdirSync(d);
+      for (const i of readdirSync(d)) {
+        const key = i.replace('.csv','');
+        if ( !selins.has(key) ) continue;
+        result[key] = readFileSync(join(d,i),'utf8');
+      }
+    };
+    
+    const itdGetItems = async function (selins=new Set()) {
+      const d = join(datadir, 'intraday');
+      if (!existsSync(d)) mkdirSync(d);
+      const dirs = readdirSync(d).filter( i => statSync(join(d,i)).isDirectory() && selins.has(i) );
+      const result = dirs.map(i => {
+        const files = readdirSync(join(d,i)).map(j => {
+          const z = j.slice(-3) === '.gz';
+          return [ z ? j.slice(0,-3) : j, readFileSync(join(d,i,j), z ? null : 'utf8') ];
+        });
+        return [ i, Object.fromEntries(files) ];
+      }).filter(i=>i);
+      return Object.fromEntries(result);
+    };
+    const itdSetItem = async function (key, obj) {
+      key = key.replace('tse.', '');
+      const d = join(datadir, 'intraday');
+      const dir = join(d, key);
+      if ( !existsSync(dir) ) mkdirSync(dir);
+      Object.keys(obj).forEach(k => {
+        const cont = obj[k];
+        const filename = k + (cont === 'N/A' ? '': '.gz');
+        writeFileSync(join(dir, filename), obj[k]);
+      });
+    };
+    
     instance = {
-      getItem, setItem, getItemAsync, setItemAsync,
-      get CACHE_DIR() { return datadir.replace(/\\/g,'/'); },
+      getItem, setItem, getItemAsync, setItemAsync, getItems,
+      get CACHE_DIR() { return datadir; },
       set CACHE_DIR(newdir) {
         if (typeof newdir === 'string') {
           if ( !existsSync(newdir) ) mkdirSync(newdir);
@@ -77,31 +116,79 @@ const storage = (function () {
             writeFileSync(pathfile, datadir);
           }
         }
+      },
+      itd: {
+        getItems: itdGetItems,
+        setItem: itdSetItem
       }
     };
   } else if (isBrowser) {
     const pako = window.pako || undefined;
     
+    const cpstore = localforage.createInstance({name: 'tse.prices'});
+    
     const getItemAsync = async (key, zip=false) => {
-      const stored = await localforage.getItem(key);
-      if (!stored || !pako) return stored;
-      return zip ? pako.ungzip(stored, {to: 'string'}) : stored;
+      let store = localforage;
+      if ( key.startsWith('tse.prices.') ) {
+        key = key.replace('prices.', '');
+        store = cpstore;
+      }
+      const v = await store.getItem(key);
+      if (!v) return '';
+      if (!pako) return v;
+      return zip ? pako.ungzip(v, {to: 'string'}) : v;
     };
     
     const setItemAsync = async (key, value, zip=false) => {
+      let store = localforage;
+      if ( key.startsWith('tse.prices.') ) {
+        key = key.replace('tse.prices.', '');
+        store = cpstore;
+      }
       if (!pako) {
-        await localforage.setItem(key, value);
+        await store.setItem(key, value);
         return;
       }
       const rdy = zip ? pako.gzip(value) : value;
-      await localforage.setItem(key, rdy);
+      await store.setItem(key, rdy);
+    };
+    
+    const getItems = async function	(selins=new Set(), result={}) {
+      await cpstore.iterate((val, key) => {
+        let k = key.replace('tse.', '');
+        if (selins.has(k)) result[k] = val;
+      });
+    };
+    
+    
+    const itdstore = localforage.createInstance({name: 'tse.intraday'});
+    
+    const itdGetItems = async function	(selins=new Set()) {
+      const result = {};
+      await itdstore.iterate((val, key) => {
+        if (selins.has(key)) result[key] = val;
+      });
+      return result;
+    };
+    const itdSetItem = async (key, value, zip=false) => {
+      if (!pako) {
+        await itdstore.setItem(key, value);
+        return;
+      }
+      const rdy = zip ? pako.gzip(value) : value;
+      await itdstore.setItem(key, rdy);
     };
     
     instance = {
-      getItem: (key)        => localStorage.getItem(key),
+      getItem: (key)        => localStorage.getItem(key) || '',
       setItem: (key, value) => localStorage.setItem(key, value),
       getItemAsync,
-      setItemAsync
+      setItemAsync,
+      getItems,
+      itd: {
+        getItems: itdGetItems,
+        setItem: itdSetItem
+      }
     };
   }
   
@@ -219,7 +306,7 @@ class Share {
 //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
 // utils
 function parseInstruments(struct=false, arr=false, structKey='InsCode') {
-  const rows = storage.getItem('tse.instruments').split(';');
+  const rows = storage.getItem('tse.instruments').split('\n');
   const instruments = arr ? [] : {};
   for (const row of rows) {
     const item = struct ? new Instrument(row) : row;
@@ -233,7 +320,7 @@ function parseInstruments(struct=false, arr=false, structKey='InsCode') {
   return instruments;
 }
 function parseShares(struct=false, arr=false, structKey='InsCode') {
-  const rows = storage.getItem('tse.shares').split(';');
+  const rows = storage.getItem('tse.shares').split('\n');
   const shares = arr ? [] : {};
   for (const row of rows) {
     const item = struct ? new Share(row) : row;
@@ -283,13 +370,38 @@ function splitArr(arr, size){
     .map( (v, i) => i % size === 0 ? arr.slice(i, i+size) : undefined )
     .filter(i => i);
 }
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
 //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-// price helpers
-Big.DP = 40; // max decimal places
-Big.RM = 2;  // rounding mode: http://mikemcl.github.io/big.js/#rm
+let UPDATE_INTERVAL           = 1;
+let PRICES_UPDATE_CHUNK       = 50;
+let PRICES_UPDATE_CHUNK_DELAY = 300;
+let PRICES_UPDATE_RETRY_COUNT = 3;
+let PRICES_UPDATE_RETRY_DELAY = 1000;
+const defaultSettings = {
+  columns: [
+    [4, 'date'],
+    [6, 'open'],
+    [7, 'high'],
+    [8, 'low'],
+    [9, 'last'],
+    [10, 'close'],
+    [12, 'vol']
+  ],
+  adjustPrices: 0,
+  daysWithoutTrade: false,
+  startDate: '20010321',
+  cache: true,
+  csv: false,
+  csvHeaders: true,
+  csvDelimiter: ',',
+  onprogress: undefined,
+  progressTotal: 100
+};
+
+let lastdevens   = {};
+let storedPrices = {};
+
+Big.DP = 40;
+Big.RM = 2; // http://mikemcl.github.io/big.js/#rm
 function adjust(cond, closingPrices, shares, insCode) {
   const cp = closingPrices;
   const len = closingPrices.length;
@@ -354,8 +466,8 @@ function getCell(columnName, instrument, closingPrice) {
   const str =
     c === 'CompanyCode'    ? instrument.CompanyCode :
     c === 'LatinName'      ? instrument.LatinName :
-    c === 'Symbol'         ? instrument.Symbol.replace(' ', '_') :
-    c === 'Name'           ? instrument.Name.replace(' ', '_') :
+    c === 'Symbol'         ? instrument.Symbol :
+    c === 'Name'           ? instrument.Name :
     c === 'Date'           ? closingPrice.DEven :
     c === 'ShamsiDate'     ? jalaali && gregToShamsi(closingPrice.DEven) :
     c === 'PriceFirst'     ? closingPrice.PriceFirst :
@@ -370,52 +482,14 @@ function getCell(columnName, instrument, closingPrice) {
   
   return str;
 }
-//@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
-let UPDATE_INTERVAL           = 1;
-let PRICES_UPDATE_CHUNK       = isBrowser ? 10  : 50;
-let PRICES_UPDATE_CHUNK_DELAY = isBrowser ? 500 : 3000;
-let PRICES_UPDATE_RETRY_COUNT = 3;
-let PRICES_UPDATE_RETRY_DELAY = 5000;
-const defaultSettings = {
-  columns: [
-    [4, 'date'],
-    [6, 'open'],
-    [7, 'high'],
-    [8, 'low'],
-    [9, 'last'],
-    [10, 'close'],
-    [12, 'vol']
-  ],
-  adjustPrices: 0,
-  daysWithoutTrade: false,
-  startDate: '20010321'
-};
-const { warn } = console;
 
-let storedPrices;
-
-async function parseStoredPrices() {
-  if (storedPrices) return storedPrices;
-  storedPrices = {};
-  
-  const storedStr = await storage.getItemAsync('tse.prices', true);
-  if (!storedStr) return storedPrices;
-  
-  const strs = storedStr.split('@');
-  for (let i=0, n=strs.length; i<n; i++) {
-    const str = strs[i];
-    if (!str) continue;
-    storedPrices[ str.split(',',1)[0] ] = str;
-  }
-}
-
-function shouldUpdate(latest='') {
-  if (!latest || latest === '0') return true; // first time (never updated before)
+function shouldUpdate(deven='', lastPossibleDeven) {
+  if (!deven || deven === '0') return true; // first time (never updated before)
   
   const today = new Date();
-  const daysPassed = dayDiff(dateToStr(today), latest);
+  const daysPassed = dayDiff(lastPossibleDeven, deven);
   const inWeekend = [4,5].includes( today.getDay() );
-  const lastUpdateWeekday = strToDate(latest).getDay();
+  const lastUpdateWeekday = strToDate(lastPossibleDeven).getDay();
   
   const result = (
     daysPassed >= UPDATE_INTERVAL &&
@@ -430,11 +504,10 @@ function shouldUpdate(latest='') {
   
   return result; 
 }
-
 async function getLastPossibleDeven() {
   let lastPossibleDeven = storage.getItem('tse.lastPossibleDeven');
   
-  if ( shouldUpdate(lastPossibleDeven) ) {
+  if ( !lastPossibleDeven || shouldUpdate(dateToStr(new Date()), lastPossibleDeven) ) {
     let error;
     const res = await rq.LastPossibleDeven().catch(err => error = err);
     if (error)                        return { title: 'Failed request: LastPossibleDeven', detail: error };
@@ -443,9 +516,8 @@ async function getLastPossibleDeven() {
     storage.setItem('tse.lastPossibleDeven', lastPossibleDeven);
   }
   
-  return +lastPossibleDeven;
+  return lastPossibleDeven;
 }
-
 async function updateInstruments() {
   const lastUpdate = storage.getItem('tse.lastInstrumentUpdate');
   let lastDeven;
@@ -465,7 +537,10 @@ async function updateInstruments() {
     lastId    = Math.max(...shareIds);
   }
   
-  if ( !shouldUpdate(''+lastDeven) ) return;
+  const lastPossibleDeven = await getLastPossibleDeven();
+  if (typeof lastPossibleDeven === 'object') return lastPossibleDeven;
+  
+  if ( !shouldUpdate(''+lastDeven, lastPossibleDeven) ) return;
   
   let error;
   const res = await rq.InstrumentAndShare(lastDeven, lastId).catch(err => error = err);
@@ -475,14 +550,16 @@ async function updateInstruments() {
   let instruments = splitted[0];
   let shares      = splitted[1];
   
-  // if (instruments === '*') warn('Cannot update during trading session hours.');
-  // if (instruments === '')  warn('Already updated: ', 'Instruments');
-  // if (shares === '')       warn('Already updated: ', 'Shares');
+  // if (instruments === '*') console.warn('Cannot update during trading session hours.');
+  // if (instruments === '')  console.warn('Already updated: ', 'Instruments');
+  // if (shares === '')       console.warn('Already updated: ', 'Shares');
   
   if (instruments !== '' && instruments !== '*') {
     if (currentInstruments && Object.keys(currentInstruments).length) {
       instruments.split(';').forEach(i => currentInstruments[ i.split(',',1)[0] ] = i);
-      instruments = Object.keys(currentInstruments).map(k => currentInstruments[k]).join(';');
+      instruments = Object.keys(currentInstruments).map(k => currentInstruments[k]).join('\n');
+    } else {
+      instruments = instruments.replace(/;/g, '\n');
     }
     storage.setItem('tse.instruments', instruments);
   }
@@ -490,7 +567,9 @@ async function updateInstruments() {
   if (shares !== '') {
     if (currentShares && Object.keys(currentShares).length) {
       shares.split(';').forEach(i => currentShares[ i.split(',',1)[0] ] = i);
-      shares = Object.keys(currentShares).map(k => currentShares[k]).join(';');
+      shares = Object.keys(currentShares).map(k => currentShares[k]).join('\n');
+    } else {
+      shares = shares.replace(/;/g, '\n');
     }
     storage.setItem('tse.shares', shares);
   }
@@ -500,7 +579,7 @@ async function updateInstruments() {
   }
 }
 
-const updatePricesManager = (function () {
+const pricesUpdateManager = (function () {
   let total = 0;
   let succs = [];
   let fails = [];
@@ -509,6 +588,9 @@ const updatePricesManager = (function () {
   let timeouts = new Map();
   let qeudRetry;
   let resolve;
+  let writing = [];
+  let pf, pn, ptot, pSR, pR;
+  let shouldCache;
   
   function poll() {
     if (timeouts.size > 0 || qeudRetry) {
@@ -517,7 +599,14 @@ const updatePricesManager = (function () {
     }
     
     if (succs.length === total || retries >= PRICES_UPDATE_RETRY_COUNT) {
-      resolve( {succs, fails} );
+      const _succs = [...succs];
+      const _fails = [...fails];
+      succs = [];
+      fails = [];
+      Promise.all(writing).then(() => {
+        writing = [];
+        resolve({succs: _succs, fails: _fails, pn});
+      });
       return;
     }
     
@@ -535,9 +624,28 @@ const updatePricesManager = (function () {
     const inscodes = chunk.map(([insCode]) => insCode);
     
     if ( typeof response === 'string' && /^[\d.,;@-]+$/.test(response) ) {
-      const succ = response.split('@').map((v,i)=> [chunk[i][0], v]);
-      succs.push(...succ);
+      const res = response.replace(/;/g, '\n').split('@').map((v,i)=> [chunk[i][0], v]);
+      
+      for (const [inscode, newdata] of res) {
+        succs.push(inscode);
+        
+        if (newdata) {
+          const olddata = storedPrices[inscode];
+          const data = olddata ? olddata+'\n'+newdata : newdata;
+          
+          storedPrices[inscode] = data;
+          lastdevens[inscode] = newdata.split('\n').slice(-1)[0].split(',',2)[1];
+          
+          writing.push( shouldCache && storage.setItemAsync('tse.prices.'+inscode, data) );
+        }
+      }
+      
       fails = fails.filter(i => inscodes.indexOf(i) === -1);
+      
+      if (pf) {
+        const filled = pSR.div(PRICES_UPDATE_RETRY_COUNT + 2).mul(retries + 1);
+        pf(pn= +Big(pn).plus( pSR.sub(filled) ) );
+      }
     } else {
       fails.push(...inscodes);
       retrychunks.push(chunk);
@@ -552,6 +660,8 @@ const updatePricesManager = (function () {
     rq.ClosingPrices(insCodes)
       .then( r => onresult(r, chunk, id) )
       .catch( () => onresult(undefined, chunk, id) );
+    
+    if (pf) pf(pn= +Big(pn).plus(pR) );
   }
   
   function batch(chunks=[]) {
@@ -564,8 +674,12 @@ const updatePricesManager = (function () {
     }
   }
   
-  function start(updateNeeded=[]) {
+  function start(updateNeeded=[], _shouldCache, po={}) {
+    shouldCache = _shouldCache;
+    ({ pf, pn, ptot } = po);
     total = updateNeeded.length;
+    pSR = ptot.div( Math.ceil(Big(total).div(PRICES_UPDATE_CHUNK)) ); // each successful request:   ( ptot / Math.ceil(total / PRICES_UPDATE_CHUNK) )
+    pR = pSR.div(PRICES_UPDATE_RETRY_COUNT + 2);                      // each request:               pSR / (PRICES_UPDATE_RETRY_COUNT + 2)
     succs = [];
     fails = [];
     retries = 0;
@@ -584,112 +698,121 @@ const updatePricesManager = (function () {
   
   return start;
 })();
-async function updatePrices(instruments=[]) {
-  if (!instruments.length) return;
-  const result = { succs: {}, fails: {}, error: undefined };
+async function updatePrices(selection=[], shouldCache, {pf, pn, ptot}={}) {
+  lastdevens = storage.getItem('tse.inscode_lastdeven');
+  let inscodes = new Set();
+  if (lastdevens) {
+    const ents = lastdevens.split('\n').map(i=>i.split(','));
+    lastdevens = Object.fromEntries(ents);
+    inscodes = new Set( Object.keys(lastdevens) );
+  } else {
+    lastdevens = {};
+  }
+  
+  let result = { succs: [], fails: [], error: undefined, pn };
+  const pfin = +Big(pn).plus(ptot);
   
   const lastPossibleDeven = await getLastPossibleDeven();
-  if (typeof lastPossibleDeven !== 'number') {
+  if (typeof lastPossibleDeven === 'object') {
     result.error = lastPossibleDeven;
+    if (pf) pf(pn= pfin);
     return result;
   }
   
-  const updateNeeded = [];
-  const oldContents = {};
-  for (const instrument of instruments) {
-    const insCode = instrument.InsCode;
+  const { startDate: firstPossibleDeven } = defaultSettings;
+  
+  const toUpdate = selection.map(instrument => {
+    const inscode = instrument.InsCode;
     const market = instrument.YMarNSC === 'NO' ? 0 : 1;
-    const insData = storedPrices[insCode];
     
-    if (!insData) { // doesn't have data
-      const firstPossibleDeven = defaultSettings.startDate;
-      updateNeeded.push( [insCode, firstPossibleDeven, market] );
+    if ( !inscodes.has(inscode) ) { // doesn't have data
+      return [inscode, firstPossibleDeven, market];
     } else { // has data
-      const rows = insData.split(';');
-      const lastDeven  =  new ClosingPrice( rows[rows.length-1] ).DEven;
-      
-      if ( shouldUpdate(lastDeven) ) { // but outdated
-        updateNeeded.push( [insCode, lastDeven, market] );
-        oldContents[insCode] = insData;
+      const lastdeven = lastdevens[inscode];
+      if (!lastdeven) return; // expired symbol
+      if ( shouldUpdate(lastdeven, lastPossibleDeven) ) { // but outdated
+        return [inscode, lastdeven, market];
       }
     }
+  }).filter(i=>i);
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
+  
+  const selins = new Set(selection.map(i => i.InsCode));
+  const storedins = new Set(Object.keys(storedPrices));
+  if ( !storedins.size || [...selins].find(i => !storedins.has(i)) ) {
+    await storage.getItems(selins, storedPrices);
   }
-  if (!Object.keys(updateNeeded).length) return result;
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   
-  const { succs, fails } = await updatePricesManager(updateNeeded);
-  
-  for (const [insCode, newContent] of succs) {
-    const oldContent = oldContents[insCode];
+  if (toUpdate.length) {
+    const managerResult = await pricesUpdateManager(toUpdate, shouldCache, { pf, pn, ptot: ptot.sub(ptot.mul(0.02)) });
+    const { succs, fails } = managerResult;
+    ({ pn } = managerResult);
     
-    let content = oldContent || '';
-    if (newContent) {
-      content = oldContent ? oldContent+';'+newContent : newContent;
+    if (succs.length && shouldCache) {
+      str = Object.keys(lastdevens).map(k => [k, lastdevens[k]].join(',')).join('\n');
+      storage.setItem('tse.inscode_lastdeven', str);
     }
     
-    storedPrices[insCode] = content;
+    result = { succs, fails };
   }
   
-  let str = '';
-  const keys = Object.keys(storedPrices);
-  for (let i=0, n=keys.length; i<n; i++) str += storedPrices[ keys[i] ] + '@';
-  str = str.slice(0, -1);
+  if (pf && pn !== pfin) pf(pn=pfin);
   
-  await storage.setItemAsync('tse.prices', str, true);
+  result.pn = pn;
   
-  return {
-    ...result,
-    succs: succs.map(([insCode]) => insCode),
-    fails
-  };
+  return result;
 }
 
 async function getPrices(symbols=[], _settings={}) {
   if (!symbols.length) return;
+  const settings = {...defaultSettings, ..._settings};
   const result = { data: [], error: undefined };
   
+  let { onprogress: pf, progressTotal: ptot } = settings;
+  if (typeof pf !== 'function') pf = undefined;
+  if (typeof ptot !== 'number') ptot = defaultSettings.progressTotal;
+  let pn = 0;
+  ptot = Big(ptot);
+  
   const err = await updateInstruments();
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   if (err) {
     const { title, detail } = err;
     result.error = { code: 1, title, detail };
+    if (pf) pf(+ptot);
     return result;
   }
   
   const instruments = parseInstruments(true, undefined, 'Symbol');
   const selection = symbols.map(i => instruments[i]);
   const notFounds = symbols.filter((v,i) => !selection[i]);
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   if (notFounds.length) {
     result.error = { code: 2, title: 'Incorrect Symbol', symbols: notFounds };
+    if (pf) pf(+ptot);
     return result;
   }
   
-  await parseStoredPrices();
+  const updateResult = await updatePrices(selection, settings.cache, {pf, pn, ptot: ptot.mul(0.78)});
+  const { succs, fails, error } = updateResult;
+  ({ pn } = updateResult);
   
-  const { succs, fails, error } = await updatePrices(selection);
   if (error) {
     const { title, detail } = error;
     result.error = { code: 1, title, detail };
+    if (pf) pf(+ptot);
     return result;
   }
   
   if (fails.length) {
-    const _selection = selection.reduce((a, {InsCode,Symbol}) => (a[InsCode] = Symbol, a), {});
+    const syms = Object.fromEntries( selection.map(i => [i.InsCode, i.Symbol]) );
     result.error = { code: 3, title: 'Incomplete Price Update',
-      fails: fails.map(k => _selection[k]),
-      succs: succs.map(k => _selection[k])
+      fails: fails.map(k => syms[k]),
+      succs: succs.map(k => syms[k])
     };
     selection.forEach((v,i,a) => fails.includes(v.InsCode) ? a[i] = undefined : 0);
   }
-  
-  const prices = {};
-  for (const i of selection) {
-    if (!i) continue;
-    const insCode = i.InsCode;
-    const strPrices = storedPrices[insCode];
-    if (!strPrices) continue; // throw new Error('Unkown Error');
-    prices[insCode] = strPrices.split(';').map(i => new ClosingPrice(i));
-  }
-  
-  const settings = {...defaultSettings, ..._settings};
   
   const columns = settings.columns.map(i => {
     const row = !Array.isArray(i) ? [i] : i;
@@ -698,33 +821,75 @@ async function getPrices(symbols=[], _settings={}) {
     return { ...column, header: finalHeader };
   });
   
-  const { adjustPrices, startDate, daysWithoutTrade } = settings;
+  const { adjustPrices, daysWithoutTrade, startDate, csv } = settings;
   const shares = parseShares(true, true);
+  const pi = Big(ptot).mul(0.20).div(selection.length);
   
-  result.data = selection.map(instrument => {
-    if (!instrument) return;
-    const res = {};
-    columns.forEach(col => res[col.header] = []);
+  if (csv) {
+    const { csvHeaders, csvDelimiter } = settings;
+    const headers = csvHeaders ? columns.map(i => i.header).join() + '\n' : '';
     
-    const insCode = instrument.InsCode;
-    if (!prices[insCode]) return res;
-    const cond = adjustPrices;
-    const closingPrices = cond === 1 || cond === 2
-      ? adjust(cond, prices[insCode], shares, insCode)
-      : prices[insCode];
-    
-    for (const closingPrice of closingPrices) {
-      if ( Big(closingPrice.DEven).lte(startDate) ) continue;
-      if ( Big(closingPrice.ZTotTran).eq(0) && !daysWithoutTrade ) continue;
+    result.data = selection.map(instrument => {
+      if (!instrument) return;
+      const inscode = instrument.InsCode;
       
-      for (const {header, name} of columns) {
-        const cell = getCell(name, instrument, closingPrice);
-        res[header].push(/^\d+(\.?\d+)?$/.test(cell) ? parseFloat(cell) : cell);
+      let prices = storedPrices[inscode];
+      if (!prices) return headers;
+      prices = prices.split('\n').map(i => new ClosingPrice(i));
+      if (adjustPrices === 1 || adjustPrices === 2) {
+        prices = adjust(adjustPrices, prices, shares, inscode);
       }
-    }
+      
+      if (!daysWithoutTrade) {
+        prices = prices.filter(i => +i.ZTotTran > 0);
+      }
+      
+      if (pf) pf(pn= +Big(pn).plus(pi) );
+      
+      return headers + prices
+        .filter(i => +i.DEven > +startDate)
+        .map(price => 
+          columns.map(i => getCell(i.name, instrument, price)).join(csvDelimiter)
+        )
+        .join('\n');
+    });
     
-    return res;
-  });
+  } else {
+    const textcols = new Set(['CompanyCode', 'LatinName', 'Symbol', 'Name']);
+    
+    result.data = selection.map(instrument => {
+      if (!instrument) return;
+      const res = Object.fromEntries( columns.map(i => [i.header, []]) );
+      
+      const inscode = instrument.InsCode;
+      
+      let prices = storedPrices[inscode];
+      if (!prices) return res;
+      prices = prices.split('\n').map(i => new ClosingPrice(i));
+      if (adjustPrices === 1 || adjustPrices === 2) {
+        prices = adjust(adjustPrices, prices, shares, inscode);
+      }
+      
+      if (!daysWithoutTrade) {
+        prices = prices.filter(i => +i.ZTotTran > 0);
+      }
+      
+      prices = prices.filter(i => +i.DEven > +startDate);
+      
+      for (const price of prices) {
+        for (const {header, name} of columns) {
+          const cell = getCell(name, instrument, price);
+          res[header].push(textcols.has(name) ? cell : parseFloat(cell));
+        }
+      }
+      
+      if (pf) pf(pn= +Big(pn).plus(pi) );
+      return res;
+    });
+    
+  }
+  
+  if (pf && pn !== ptot) pf(pn=ptot);
   
   return result;
 }
@@ -735,31 +900,35 @@ async function getInstruments(struct=true, arr=true, structKey='InsCode') {
   
   const lastUpdate = storage.getItem('tse.lastInstrumentUpdate');
   const err = await updateInstruments();
-  if (err && !lastUpdate) return;
+  if (err && !lastUpdate) throw err;
   
   return parseInstruments(struct, arr, structKey);
 }
 //@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+let INTRADAY_URL = (server='',inscode='',deven='') => `http://cdn${server}.tsetmc.com/Loader.aspx?ParTree=15131P&i=${inscode}&d=${deven}`;
 let INTRADAY_UPDATE_CHUNK_DELAY = 100;
-let INTRADAY_UPDATE_RETRY_COUNT = 7;
+let INTRADAY_UPDATE_RETRY_COUNT = 9;
 let INTRADAY_UPDATE_RETRY_DELAY = 1000;
 const itdDefaultSettings = {
   startDate: '20010321',
   endDate: '',
+  cache: true,
   gzip: true,
-  onprogress: undefined
+  onprogress: undefined,
+  progressTotal: 100
 };
 const itdGroupCols = [
-  [ 'prices',  ['time','last','close','open','high','low','count','volume','value','discarded'] ],
-  [ 'orders',  ['time','row','askcount','askvol','askprice','bidprice','bidvol','bidcount'] ],
-  [ 'trades',  ['time','count','volume','price','discarded'] ],
+  [ 'price',  ['time','last','close','open','high','low','count','volume','value','discarded'] ],
+  [ 'order',  ['time','row','askcount','askvol','askprice','bidprice','bidvol','bidcount'] ],
+  [ 'trade',  ['time','count','volume','price','discarded'] ],
   [ 'client', [
       'pbvol','pbcount','pbval','pbprice','pbvolpot',
       'psvol','pscount','psval','psprice','psvolpot',
       'lbvol','lbcount','lbval','lbprice','lbvolpot',
-      'lsvol','lscount','lsval','lsprice','lsvolpot', 'plchg']
+      'lsvol','lscount','lsval','lsprice','lsvolpot', 'lpchg']
   ],
-  [ 'misc',  ['state','daymin','daymax'] ]
+  [ 'misc',  ['state','daymin','daymax'] ],
+  [ 'shareholder', ['shares','sharespot','change','companycode','companyname'] ]
 ];
 
 let stored = {};
@@ -775,52 +944,6 @@ if (isNode) {
   zip   = str => gzip(str);
   unzip = buf => ungzip(buf, {to: 'string'});
 }
-
-const itdstore = (function () {
-  let setItem;
-  let getItems;
-  
-  if (isNode) {
-    const { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync } = require('fs');
-    const { join } = require('path');
-    
-    getItems = async function (selins=new Set()) {
-      const d = storage.CACHE_DIR;
-      const dirs = readdirSync(d).filter( i => statSync(join(d,i)).isDirectory() && selins.has(i) );
-      const result = dirs.map(i => {
-        const files = readdirSync(join(d,i)).map(j => [ j.slice(0,-3), readFileSync(join(d,i,j)) ])
-        return [ i, Object.fromEntries(files) ];
-      }).filter(i=>i);
-      return Object.fromEntries(result);
-    };
-    
-    setItem = async function (key, obj) {
-      key = key.replace('tse.', '');
-      const d = storage.CACHE_DIR;
-      const dir = join(d, key);
-      if ( !existsSync(dir) ) mkdirSync(dir);
-      Object.keys(obj).forEach(k => {
-        writeFileSync(join(dir, k+'.gz'), obj[k]);
-      });
-    };
-    
-  } else if (isBrowser) {
-    
-    getItems = async function	(selins=new Set()) {
-      const result = {};
-      await localforage.iterate((val, key) => {
-        let k = key.replace('tse.', '');
-        if (selins.has(k)) result[k] = val;
-      });
-      return result;
-    };
-    
-    setItem = storage.setItemAsync;
-    
-  }
-  
-  return { getItems, setItem };
-})();
 
 function objify(map, r={}) {
   for (let [k,v] of map) {
@@ -839,7 +962,7 @@ function parseRaw(separator, text) {
   return arr;
 }
 
-async function extractAndStore(inscode='', deven_text=[]) {
+async function extractAndStore(inscode='', deven_text=[], shouldCache) {
   if (!stored[inscode]) stored[inscode] = {};
   let storedInstrument = stored[inscode];
   
@@ -854,24 +977,23 @@ async function extractAndStore(inscode='', deven_text=[]) {
     let ClientType      = parseRaw('var ClientTypeData=[', text);
     let InstrumentState = parseRaw('var InstrumentStateData=[', text);
     let StaticTreshhold = parseRaw('var StaticTreshholdData=[', text);
-    // let ShareHolder     = parseRaw('var ShareHolderData=[', text);
-    // let ShareHolderYesterday = parseRaw('var ShareHolderDataYesterday=[', text);
+    let ShareHolder     = parseRaw('var ShareHolderData=[', text);
     
     let coli;
     
     coli = [12,2,3,4,6,7,8,9,10,11];
-    let price = ClosingPrice.map(row => coli.map(i=> row[i]).join(',') ).join(';');
+    let price = ClosingPrice.map(row => coli.map(i=> row[i]).join(',') ).join('\n');
     
     coli = [0,1,2,3,4,5,6,7];
-    let order = BestLimit.map(row => coli.map(i=> row[i]).join(',') ).join(';');
+    let order = BestLimit.map(row => coli.map(i=> row[i]).join(',') ).join('\n');
     
     coli = [1,0,2,3,4];
     let trade = IntraTrade.map(row => {
       let [h,m,s] = row[1].split(':');
       let timeint = (+h*10000) + (+m*100) + (+s) + '';
       row[1] = timeint;
-      return coli.map(i => row[i]).join(',');
-    }).join(';');
+      return coli.map(i => row[i]);
+    }).sort((a,b)=>+a[0]-b[0]).map(i=>i.join(',')).join('\n');
     
     coli = [4,0,12,16,8,6,2,14,18,10,5,1,13,17,9,7,3,15,19,11,20];
     let client = coli.map(i=> ClientType[i]).join(',');
@@ -882,12 +1004,19 @@ async function extractAndStore(inscode='', deven_text=[]) {
     if (b.length && b[1].length) { daymin = b[1][2]; daymax = b[1][1]; }
     let misc = [state, daymin, daymax].join(',');
     
+    coli = [2,3,4,0,5];
+    let shareholder = ShareHolder.filter(i=>i[4]).map(row => {
+      row[4] = ({ArrowUp:'+', ArrowDown:'-'})[row[4]];
+      row[5] = cleanFa(row[5]);
+      return coli.map(i => row[i]).join(',');
+    }).join('\n');
     
-    let file = [price, order, trade, client, misc].join('@');
+    
+    let file = [price, order, trade, client, misc, shareholder].filter(i=>i).join('\n\n');
     storedInstrument[deven] = zip(file);
   }
   
-  return itdstore.setItem('tse.'+inscode, storedInstrument);
+  if (shouldCache) return storage.itd.setItem(inscode, storedInstrument);
 }
 const itdUpdateManager = (function () {
   let src = {};
@@ -901,8 +1030,8 @@ const itdUpdateManager = (function () {
   let resolve;
   let nextsrv = n => n<7 ? ++n : 0;
   let writing = [];
-  let pf;
-  let pn = 4;
+  let pf, pn, ptot, pSR, pR;
+  let shouldCache;
   
   function poll() {
     if (timeouts.size > 0 || qeudRetry) {
@@ -915,7 +1044,7 @@ const itdUpdateManager = (function () {
       let _fails = [ ...fails.map(i => i.slice(1)) ];
       succs = [];
       fails = [];
-      src = {};
+      if (isBrowser) src = {};
       
       Promise.all(writing).then(() => {
         writing = [];
@@ -941,17 +1070,26 @@ const itdUpdateManager = (function () {
       let _chunk = chunk.slice(1);
       succs.push(_chunk);
       let [inscode, deven] = _chunk;
-      let devens = src[inscode];
-      devens[deven] = res;
       
-      let alldone = !Object.keys(devens).find(k => !devens[k]);
-      if (alldone) {
-        let deven_text = Object.keys(devens).map(k => [k, devens[k]]);
-        writing.push( extractAndStore(inscode, deven_text) );
+      if (isBrowser) {
+        let devens = src[inscode];
+        devens[deven] = res;
+        
+        let alldone = !Object.keys(devens).find(k => !devens[k]);
+        if (alldone) {
+          let deven_text = Object.keys(devens).map(k => [k, devens[k]]);
+          writing.push( extractAndStore(inscode, deven_text, shouldCache) );
+        }
+      } else {
+        writing.push( extractAndStore(inscode, [[deven, res]], shouldCache) );
       }
       
       fails = fails.filter(i => i.join() !== chunk.join());
-      if (pf) pf(pn+=96/total/2);
+      
+      if (pf) {
+        let filled = pSR.div(INTRADAY_UPDATE_RETRY_COUNT + 2).mul(retries + 1);
+        pf(pn= +Big(pn).plus( pSR.sub(filled) ) );
+      }
     } else {
       fails.push(chunk);
       retrychunks.push(chunk);
@@ -963,7 +1101,7 @@ const itdUpdateManager = (function () {
   async function request(chunk=[], id) {
     let [server, inscode, deven] = chunk;
     
-    fetch('http://cdn'+(server?server:'')+'.tsetmc.com/Loader.aspx?ParTree=15131P&i='+inscode+'&d='+deven)
+    fetch(INTRADAY_URL((server?server:''), inscode, deven))
       .then(async res => {
         let { status } = res;
         
@@ -972,17 +1110,20 @@ const itdUpdateManager = (function () {
           if (text.includes('Object moved to <a href="/GeneralError.aspx?aspxerrorpath=/Loader.aspx">here</a>')) {
             onresult('N/A', chunk, id);
           } else {
-            onresult(text, chunk, id);
+            let isPageUpToDate = text.split('var IntraTradeData=[')[1].split('];')[0];
+            if (isPageUpToDate) {
+              onresult(text, chunk, id);
+            } else {
+              onresult(undefined, chunk, id);
+            }
           }
-        } else if (res.status >= 500) {
-          onresult('N/A', chunk, id);
         } else {
           onresult(undefined, chunk, id);
         }
       })
       .catch(() => onresult(undefined, chunk, id));
     
-    if (pf) pf(pn+=96/total/INTRADAY_UPDATE_RETRY_COUNT/2);
+    if (pf) pf(pn= +Big(pn).plus(pR) );
   }
   
   function batch(chunks=[]) {
@@ -995,12 +1136,14 @@ const itdUpdateManager = (function () {
     }
   }
   
-  async function start(inscode_devens, _pf) {
-    pf = _pf;
-    pn = 4;
-    src = objify( inscode_devens.map(([a,b]) => [ a, b.map(i=>[i,undefined]) ]) );
+  async function start(inscode_devens, _shouldCache, po) {
+    shouldCache = _shouldCache;
+    ({ pf, pn, ptot } = po);
+    if (isBrowser) src = objify( inscode_devens.map(([a,b]) => [ a, b.map(i=>[i,undefined]) ]) );
     let chunks = [...inscode_devens].reduce((r,[inscode,devens]) => r=[...r, ...(devens ? devens.map(i=>[0,inscode,''+i]) : []) ], []);
     total = chunks.length;
+    pSR = ptot.div(total);                         // each successful request:   ptot / total
+    pR = pSR.div(INTRADAY_UPDATE_RETRY_COUNT + 2); // each request:              pSR / (INTRADAY_UPDATE_RETRY_COUNT + 2)
     succs = [];
     fails = [];
     retries = 0;
@@ -1021,52 +1164,59 @@ const itdUpdateManager = (function () {
 
 async function getIntraday(symbols=[], _settings={}) {
   if (!symbols.length) return;
+  const settings = {...itdDefaultSettings, ..._settings};
   const result = { data: [], error: undefined };
-  let { onprogress: pf } = _settings;
+  
+  let { onprogress: pf, progressTotal: ptot } = settings;
   if (typeof pf !== 'function') pf = undefined;
+  if (typeof ptot !== 'number') ptot = itdDefaultSettings.progressTotal;
   let pn = 0;
+  ptot = Big(ptot);
   
   const err = await updateInstruments();
-  if (pf) pf(++pn);
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   if (err) {
     const { title, detail } = err;
     result.error = { code: 1, title, detail };
-    if (pf) pf(100);
+    if (pf) pf(+ptot);
     return result;
   }
   
   const instruments = parseInstruments(true, undefined, 'Symbol');
   const selection = symbols.map(i => instruments[i]);
   const notFounds = symbols.filter((v,i) => !selection[i]);
-  if (pf) pf(++pn);
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   if (notFounds.length) {
     result.error = { code: 2, title: 'Incorrect Symbol', symbols: notFounds };
-    if (pf) pf(100);
+    if (pf) pf(+ptot);
     return result;
   }
   
   const selins = new Set(selection.map(i => i && i.InsCode));
   
-  let storedInscodeDevens = await storage.getItemAsync('tse.inscode_devens', true);
-  storedInscodeDevens = storedInscodeDevens ? storedInscodeDevens.split('@').map(i=>i.split(';')).map(([i,d]) => [i,d.split(',').map(i=>+i)]): [];
+  let storedInscodeDevens = await storage.getItemAsync('tse.inscode_devens');
+  storedInscodeDevens = storedInscodeDevens ? storedInscodeDevens.split('\n').map(i=>i.split(';')).map(([i,d]) => [i,d.split(',').map(i=>+i)]): [];
   const storedInscodes = new Set(storedInscodeDevens.map(i => i[0]));
   
-  if ( !storedInscodeDevens || [...selins].find(i => !storedInscodes.has(i)) ) {
-    await parseStoredPrices();
+  const { cache } = settings;
+  
+  if ( !storedInscodeDevens.length || [...selins].find(i => !storedInscodes.has(i)) ) {
+    const upres = await updatePrices(selection, cache, {pf, pn, ptot: ptot.mul(0.10)});
+    const { succs, fails, error } = upres;
+    ({ pn } = upres);
     
-    const { succs, fails, error } = await updatePrices(selection);
     if (error) {
       const { title, detail } = error;
       result.error = { code: 1, title, detail };
-      if (pf) pf(100);
+      if (pf) pf(+ptot);
       return result;
     }
     
     if (fails.length) {
-      const _selection = selection.reduce((a, {InsCode,Symbol}) => (a[InsCode] = Symbol, a), {});
+      const syms = Object.fromEntries( selection.map(i => [i.InsCode, i.Symbol]) );
       result.error = { code: 3, title: 'Incomplete Price Update',
-        fails: fails.map(k => _selection[k]),
-        succs: succs.map(k => _selection[k])
+        fails: fails.map(k => syms[k]),
+        succs: succs.map(k => syms[k])
       };
       selection.forEach((v,i,a) => fails.includes(v.InsCode) ? a[i] = undefined : 0);
     }
@@ -1074,17 +1224,20 @@ async function getIntraday(symbols=[], _settings={}) {
     storedInscodeDevens = Object.keys(storedPrices).map(inscode => {
       const prices = storedPrices[inscode];
       if (!prices) return;
-      const devens = prices.split(';').map(i => +i.split(',',2)[1]);
+      const devens = prices
+        .split('\n')
+        .filter(i => +i.split(',',5)[4] > 0) // count > 0
+        .map(i => +i.split(',',2)[1]);       // deven
       return [inscode, devens];
     }).filter(i=>i);
     
-    const str = storedInscodeDevens.map(([i,d]) => [i, d.join(',')]).map(i => i.join(';')).join('@');
-    await storage.setItemAsync('tse.inscode_devens', str, true);
+    if (cache) {
+      const str = storedInscodeDevens.map(([i,d]) => [i, d.join(',')].join(';') ).join('\n');
+      await storage.setItemAsync('tse.inscode_devens', str);
+    }
   }
   storedInscodeDevens = Object.fromEntries(storedInscodeDevens);
-  if (pf) pf(++pn);
-  
-  const settings = {...itdDefaultSettings, ..._settings};
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   
   /** note:  ↓... let == const (mostly) */
   
@@ -1102,7 +1255,7 @@ async function getIntraday(symbols=[], _settings={}) {
     return [inscode, askedDevens];
   });
   
-  stored = await itdstore.getItems(selins);
+  stored = await storage.itd.getItems(selins);
   
   let toUpdate = askedInscodeDevens.map(([inscode, devens]) => {
     if (!inscode || !devens.length) return;
@@ -1110,13 +1263,13 @@ async function getIntraday(symbols=[], _settings={}) {
     let needupdate = devens.filter(deven => !stored[inscode][deven]);
     if (needupdate.length) return [inscode, needupdate];
   }).filter(i=>i);
-  if (pf) pf(++pn);
+  if (pf) pf(pn= +Big(pn).plus( ptot.mul(0.01) ) );
   
   if (toUpdate.length > 0) {
-    let { succs, fails } = await itdUpdateManager(toUpdate, pf);
+    let { succs, fails } = await itdUpdateManager(toUpdate, cache, {pf, pn, ptot: ptot.mul(0.85)});
     
     if (fails.length) {
-      let k = selection.reduce((a, {InsCode,Symbol}) => (a[InsCode] = Symbol, a), {});
+      let k = Object.fromEntries( selection.map(i => [i.InsCode, i.Symbol]) );
       let reducer = (o,[i,d]) => (!o[k[i]] && (o[k[i]]=[]), o[k[i]].push(d), o);
       result.error = { code: 4, title: 'Incomplete Intraday Update',
         fails: fails.reduce(reducer, {}),
@@ -1124,7 +1277,7 @@ async function getIntraday(symbols=[], _settings={}) {
       };
     }
   }
-  if (pf) pf(pn=96);
+  if (pf) pf(pn= +ptot.mul(0.99) );
   
   let { gzip } = settings;
   
@@ -1134,10 +1287,10 @@ async function getIntraday(symbols=[], _settings={}) {
     if (gzip) {
       return devens.map(deven => [ deven, instr[deven] ]);
     } else {
-      return devens.map(deven => [ deven, typeof instr[deven] === 'string' ? instr[deven] : unzip(instr[deven]) ]);
+      return devens.map(deven => [ deven, !instr[deven] || typeof instr[deven] === 'string' ? instr[deven] : unzip(instr[deven]) ]);
     }
   });
-  if (pf) pf(100);
+  if (pf) pf(+ptot);
   
   return result;
 }
@@ -1145,7 +1298,6 @@ async function getIntraday(symbols=[], _settings={}) {
 const instance = {
   getPrices,
   getInstruments,
-  getIntraday,
   
   get API_URL() { return API_URL; },
   set API_URL(v) {
@@ -1173,6 +1325,26 @@ const instance = {
   get columnList() {
     return [...Array(15)].map((v,i) => ({name: cols[i], fname: colsFa[i]}));
   },
+  
+  getIntraday,
+  
+  get INTRADAY_URL() { return INTRADAY_URL; },
+  set INTRADAY_URL(v) {
+    if (typeof v !== 'function') return;
+    let bad;
+    try { new URL(v()); } catch (e) { bad = true; throw e; }
+    if (!bad) INTRADAY_URL = v;
+  },
+  
+  get INTRADAY_UPDATE_CHUNK_DELAY() { return INTRADAY_UPDATE_CHUNK_DELAY; },
+  set INTRADAY_UPDATE_CHUNK_DELAY(v) { if (Number.isInteger(v)) INTRADAY_UPDATE_CHUNK_DELAY = v; },
+  
+  get INTRADAY_UPDATE_RETRY_COUNT() { return INTRADAY_UPDATE_RETRY_COUNT; },
+  set INTRADAY_UPDATE_RETRY_COUNT(v) { if (Number.isInteger(v)) INTRADAY_UPDATE_RETRY_COUNT = v; },
+  
+  get INTRADAY_UPDATE_RETRY_DELAY() { return INTRADAY_UPDATE_RETRY_DELAY; },
+  set INTRADAY_UPDATE_RETRY_DELAY(v) { if (Number.isInteger(v)) INTRADAY_UPDATE_RETRY_DELAY = v; },
+  
   itdGroupCols
 };
 if (isNode) {

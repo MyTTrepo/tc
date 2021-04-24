@@ -5,9 +5,10 @@ if (require.main !== module) {
   return;
 }
 const cmd = require('commander');
+const Progress = require('progress');
 const { readFileSync, writeFileSync, existsSync, statSync, mkdirSync } = require('fs');
 const { join, resolve } = require('path');
-const { toGregorian } = require('jalaali-js');
+const { toGregorian, toJalaali } = require('jalaali-js');
 require('./lib/colors.js');
 
 const defaultSettings = {
@@ -21,18 +22,33 @@ const defaultSettings = {
   fileExtension:         'csv',
   fileDelimiter:         ',',
   fileEncoding:          'utf8bom',
-  fileHeaders:           true
+  fileHeaders:           true,
+  cache:                 true,
+  intraday: {
+    symbols:      [],
+    startDate:    '1d',
+    endDate:      '',
+    gzip:         false,
+    outdir:       './',
+    dirName:       4,
+    fileEncoding: 'utf8bom',
+    fileHeaders:  true,
+    cache:        true
+  }
 };
 if ( !existsSync(join(__dirname,'settings.json')) ) saveSettings(defaultSettings);
 const savedSettings = require('./settings.json');
 const { log } = console;
-const t = '\n\t\t\t\t\t';
+const t  = '\n\t\t\t\t\t ';
+const t2 = '\n\t\t\t\t ';
+const t3 = '\n\t\t\t     ';
 
 cmd
   .helpOption('-h, --help', 'Show help.')
   .name('tse')
-  .usage('[symbols] [options]\n  tse faSymbol1 faSymbol2 -o /tsedata -j 1 -x txt -e utf8 -H')
-  .description('A client for receiving stock data from the Tehran Stock Exchange (TSE).')
+  .usage('[symbols...] [options]\n  tse faSymbol1 faSymbol2 -o /mydata -j 1 -x txt -e utf8 -H')
+  .description('A client for fetching stock data from the Tehran Stock Exchange. (TSETMC)')
+  .arguments('[symbols...]').action(() => 0)
   .option('-s, --symbol <string>',           'A space-separated string of symbols.')
   .option('-i, --symbol-file <string>',      'Path to a file that contains newline-separated symbols.')
   .option('-f, --symbol-filter <string>',    'Select symbols based on a filter string. (AND-based)'+t+'market type:     m=id,id,... (help: tse ls -M)'+t+'symbol type:     t=id,id,... (help: tse ls -T)'+t+'industry sector: i=id,id,... (help: tse ls -I)'+t+'example:  tse -m "t=300,303 i=27"'+t+'only see: tse ls -F "t=300,303 i=27"')
@@ -48,6 +64,7 @@ cmd
   .option('-l, --file-delimiter <string>',   'A single character to use as delimiter in generated files. default: ,')
   .option('-e, --file-encoding <string>',    'Encoding of the generated files. options: utf8|utf8bom|ascii. default: utf8bom')
   .option('-H, --file-no-headers',           'Boolean. Generate files without the header row. default: false')
+  .option('-k, --no-cache',                  'Boolean. Do not cache the data. default: false')
   .option('--save',                          'Boolean. Save options for later use. default: false')
   .option('--save-reset',                    'Boolean. Reset saved options back to defaults. default: false')
   .option('--cache-dir [path]',              'Show or change the location of cache directory.'+t+'if [path] is provided, new location is set but'+t+'existing content is not moved to the new location.')
@@ -63,146 +80,342 @@ cmd.command('list').alias('ls').description('Show information about current sett
   .option('-B, --id-board',                  'Show all possible board IDs. "Instrument.CComVal"')
   .option('-Y, --id-market-code',            'Show all possible market-code IDs. "Instrument.YMarNSC"')
   .option('-G, --id-symbol-gcode',           'Show all possible symbol-group IDs. "Instrument.CGrValCot"')
-  .option('-O, --id-sort [columnIndex]',     'Sort the IDs table by specifying the index of the column. default: 1'+t+'put underline at end for ascending sort: 1_')
+  .option('-O, --id-sort [columnIndex]',     'Sort the IDs table by specifying the index of the column. default: 1'+t2+'put underline at end for ascending sort: 1_')
   .option('--search <query>',                'Search symbols.')
   .action(list);
+
+const itdopts = [
+  '-s, --symbol <string>',
+  '-i, --symbol-file <string>',
+  '-f, --symbol-filter <string>',
+  '-d, --symbol-delete',
+  '-a, --symbol-all',
+  '-b, --start-date <string>     default: "1d"',
+  '-o, --outdir <string>         Same as --file-outdir',
+  '-n, --dir-name <number>       Same as --file-name',
+  '-e, --file-encoding <string>',
+  '-H, --file-no-headers',
+  '-k, --no-cache'
+].join('\n  ');
+
+cmd.command('intraday [symbols...]').alias('itd').description('Crawl Intraday Data. (help: tse itd -h)')
+  .addHelpText('after', '\nCommon Options:\n  '+itdopts)
+  .option('-m, --end-date <string>',         'Upper boundary for --start-date. default: ""'+t3+'Accepts same patterns as --start-date'+t3+'Cannot be less than --start-date'+t3+'If empty, then latest possible date is used')
+  .option('-z, --gzip',                      'Output raw gzip files. default: false')
+  .option('-y, --alt-date',                  'Output results with Shamsi dates. default: false')
+  .action(intraday);
 cmd.parse(process.argv);
 
 const subs = new Set( cmd.commands.map(i=>[i.name(),i.alias()]).reduce((a,c)=>a=a.concat(c),[]) );
 if (cmd.rawArgs.find(i=> subs.has(i))) return;
-if (cmd.cacheDir) { handleCacheDir(cmd.cacheDir); return; }
+if (cmd.opts().cacheDir) { handleCacheDir(cmd.opts().cacheDir); return; }
 
-let settings;
 
-(async function () {
-const instruments = await tse.getInstruments();
-const allSymbols = instruments.map(i => i.Symbol);
-const symbols = resolveSymbols(allSymbols, savedSettings.symbols, instruments, cmd);
-settings = resolveSettings(symbols, defaultSettings, savedSettings, cmd.opts());
 
-log('Total symbols:'.grey, (symbols.length+'').yellow );
-
-if (symbols.length) {
-  const { priceColumns, priceStartDate, priceDaysWithoutTrade } = settings;
-  let { priceAdjust } = settings;
-  priceAdjust = +priceAdjust;
-
-  let priceStartDateParsed;
-  if (priceStartDate) {
-    const s = priceStartDate;
-    const mindate = 20010321;
-    const relative = s.match(/^(\d{1,3})(y|m|d)$/);
-    if (relative) {
-      const n = parseInt(relative[1], 10);
-      const m = ({y:'FullYear',m:'Month',d:'Date'})[ relative[2] ];
-      const d = new Date();
-      d['set'+m](d['get'+m]() - n);
-      d.setDate(d.getDate() - 1);
-      const res = (d.getFullYear()*10000) + ((d.getMonth()+1)*100) + d.getDate();
-      priceStartDateParsed = res < mindate ? ''+mindate : ''+res;
-    } else if (/^\d{8}$/.test(s)) {
-      const {gy,gm,gd} = toGregorian(+s.slice(0,4), +s.slice(4,6), +s.slice(6,8));
-      const res = (gy*10000) + (gm*100) + gd;
-      priceStartDateParsed = res < mindate ? ''+mindate : ''+res;
-    } else {
-      abort('Invalid option:', '--price-start-date', '\n\tPattern not matched:'.red, '^\\d{1,3}(y|m|d)$');
-      return;
-    }
-  }
+(async () => {
+  let inserr;
+  const instruments = await tse.getInstruments().catch(err => inserr = err);
+  if (inserr) { log('\nFatal Error #1:  '.red + inserr.title.red +'\n\n'+ inserr.detail.message.red); process.exitCode = 1; return; }
+  const rawOpts = cmd.opts();
+  const allSymbols = instruments.map(i => i.Symbol);
+  const symbols = resolveSymbols(allSymbols, savedSettings.symbols, instruments, {args: cmd.args, ...rawOpts});
   
-  let priceColumnsParsed;
-  if (priceColumns) {
-    priceColumnsParsed = parseColstr(priceColumns);
-    if (!priceColumnsParsed) abort('Invalid option:', '--price-columns');
-  }
+  const fileHeaders = !rawOpts.fileNoHeaders;
+  delete rawOpts.fileNoHeaders;
+  const opts = { symbols, fileHeaders, ...rawOpts };
+  ['save','saveReset'].forEach(k => delete opts[k]);
+  Object.keys(opts).forEach(key => opts[key] === undefined && delete opts[key]);
   
-  if ( !/^[0-2]$/.test(''+priceAdjust) ) { abort('Invalid option:', '--price-adjust', '\n\tPattern not matched:'.red, '^[0-2]$'); return; }
+  const settings = { ...defaultSettings, ...savedSettings, ...opts };
   
-  const _settings = {
-    columns:          priceColumnsParsed,
-    adjustPrices:     priceAdjust,
-    daysWithoutTrade: priceDaysWithoutTrade,
-    startDate:        priceStartDateParsed
-  };
-  const { error, data } = await tse.getPrices(symbols, _settings);
-  
-  if (error) {
-    const { code, title } = error;
-    const fatal = ('Fatal Error #'+code+':').red +'  '+ title.red +'\n\n';
+  log('Total symbols:'.grey, (symbols.length+'').yellow );
+
+  if (symbols.length) {
+    const progress = new Progress(':bar :percent (Elapsed: :elapsed s)', {total: 100, width: 18, complete: '█', incomplete: '░', clear: true});
     
-    if (code === 1) {
-      const { detail } = error;
-      const msg = typeof detail === 'object' ? detail.message : detail;
-      log(fatal + msg.red);
-    } else if (code === 2) {
-      const { symbols } = error;
-      log(fatal + symbols.join('\n').red);
-    } else if (code === 3) {
-      const { fails, succs } = error;
-      const msg = ''
-        + ('\n'+title+':').redBold + '\n\t'
-        + ('X fail: '+fails.length).red + '\n\t'
-        + ('√ done: '+succs.length).green;
-      log(msg);
+    const { priceColumns, priceDaysWithoutTrade, fileDelimiter, fileHeaders, fileOutdir, fileExtension, cache } = settings;
+    let { priceStartDate, priceAdjust, fileName, fileEncoding } = settings;
+    priceStartDate = parseDateOption(priceStartDate);
+    priceAdjust    = +priceAdjust;
+    fileName       = +fileName;
+    
+    if (!priceStartDate) { abort('Invalid option:', '--price-start-date', '\n\tPattern not matched:'.red, '^\\d{1,3}(y|m|d)$'); return }
+    
+    let priceColumnsParsed;
+    if (priceColumns) {
+      priceColumnsParsed = parseColstr(priceColumns);
+      if (!priceColumnsParsed) { abort('Invalid option:', '--price-columns'); return; }
     }
-    process.exitCode = 1;
-    return;
-  }
-  
-  const { fileDelimiter, fileHeaders } = settings;
-  
-  if ( !/^.$/.test(fileDelimiter) ) { abort('Invalid option:', '--file-delimiter', '\n\tPattern not matched:'.red, '^.$'); return; }
-  
-  const files = [];
-  const headers = priceColumnsParsed.map(i=>i[1]);
-  const headerRow = headers.join(fileDelimiter) + '\n';
-  for (let i=0, n=data.length; i<n; i++) {
-    const sym = data[i];
-    const fcol = sym[ headers[0] ];
-    let file = fileHeaders ? headerRow : '';
-    for (let j=0, m=fcol.length; j<m; j++) {
-      for (const k of headers) {
-        file += sym[k][j] + fileDelimiter;
+    
+    if ( !/^[0-2]$/.test(''+priceAdjust) )            { abort('Invalid option:', '--price-adjust',   '\n\tPattern not matched:'.red, '^[0-2]$');                     return; }
+    if ( !/^.$/.test(fileDelimiter) )                 { abort('Invalid option:', '--file-delimiter', '\n\tPattern not matched:'.red, '^.$');                         return; }
+  //if (!existsSync(fileOutdir))                      { abort('Invalid option:', '--file-outdir',    '\n\tDirectory doesn\'t exist:'.red, resolve(fileOutdir).grey); return; }
+    if ( !existsSync(fileOutdir) ) mkdirSync(fileOutdir);
+    if ( !statSync(fileOutdir).isDirectory() )        { abort('Invalid option:', '--file-outdir',    '\n\tPath is not a directory:'.red,  resolve(fileOutdir).grey); return; }
+    if ( !/^[0-4]$/.test(''+fileName) )               { abort('Invalid option:', '--file-name',      '\n\tPattern not matched:'.red, '^[0-4]$');                     return; }
+    if ( !/^.{1,11}$/.test(fileExtension) )           { abort('Invalid option:', '--file-name',      '\n\tPattern not matched:'.red, '^.{1,11}$');                   return; }
+    if ( !/^(utf8(bom)?|ascii)$/.test(fileEncoding) ) { abort('Invalid option:', '--file-encoding',  '\n\tPattern not matched:'.red, '^(utf8(bom)?|ascii)$');        return; }
+    
+    const _settings = {
+      columns:          priceColumnsParsed,
+      adjustPrices:     priceAdjust,
+      daysWithoutTrade: priceDaysWithoutTrade,
+      startDate:        priceStartDate,
+      csv:              true,
+      csvHeaders:       fileHeaders,
+      csvDelimiter:     fileDelimiter,
+      onprogress:       (n) => progress.tick(n - progress.curr),
+      progressTotal:    86,
+      cache
+    };
+    const { error, data } = await tse.getPrices(symbols, _settings);
+    
+    let incompleteError, incompleteCount;
+    if (error) {
+      const { code, title } = error;
+      
+      process.exitCode = 1;
+      
+      if (code === 1 || code === 2) {
+        const fatal = ('\nFatal Error #'+code+':').red +'  '+ title.red +'\n\n';
+        
+        if (code === 1) {
+          const { detail } = error;
+          const msg = typeof detail === 'object' ? detail.message : detail;
+          log(fatal + msg.red);
+        } else if (code === 2) {
+          const { symbols } = error;
+          log(fatal + symbols.join('\n').red);
+        }
+        
+        return;
+      
+      } else if (code === 3) {
+        const { fails } = error;
+        
+        incompleteCount = fails.length;
+        incompleteError = '\n'
+            + (title+':').redBold + '\n'
+            + fails.join('\n').red;
+        
+        fails.forEach(i => data[ symbols.indexOf(i) ] = undefined);
       }
-      file = file.slice(0,-1);
-      file += '\n';
     }
-    files.push(file);
+    
+    const symins = await tse.getInstruments(true, false, 'Symbol');
+    let bom = '';
+    if (fileEncoding === 'utf8bom') {
+      bom = '\ufeff';
+      fileEncoding = undefined;
+    }
+    
+    const datalen = data.length;
+    
+    data.forEach((file, i) => {
+      const sym = symbols[i];
+      const instrument = symins[sym];
+      const name = safeWinFilename( getFilename(fileName, instrument, priceAdjust) );
+      writeFileSync(join(fileOutdir, name+'.'+fileExtension), bom+file, fileEncoding);
+      progress.tick(14/datalen);
+    });
+    
+    if (!progress.complete) progress.tick(progress.total - progress.curr);
+    
+    if (incompleteError) {
+      log((' √: '+(datalen - incompleteCount)).green + ('\n X: '+incompleteCount).red);
+      log(incompleteError);
+    } else {
+      log(' √'.green);
+    }
+  } else {
+    log('\nNo symbols to process.'.redBold);
   }
-  
-  const { fileOutdir, fileExtension } = settings;
-  let { fileName, fileEncoding } = settings;
-  fileName = +fileName;
-  
-//if (!existsSync(fileOutdir))                      { abort('Invalid option:', '--file-outdir',    '\n\tDirectory doesn\'t exist:'.red, resolve(fileOutdir).grey); return; }
-  if ( !existsSync(fileOutdir) ) mkdirSync(fileOutdir);
-  if ( !statSync(fileOutdir).isDirectory() )        { abort('Invalid option:', '--file-outdir',    '\n\tPath is not a directory:'.red,  resolve(fileOutdir).grey); return; }
-  if ( !/^[0-4]$/.test(''+fileName) )               { abort('Invalid option:', '--file-name',      '\n\tPattern not matched:'.red, '^[0-4]$');                     return; }
-  if ( !/^.{1,11}$/.test(''+fileExtension) )        { abort('Invalid option:', '--file-name',      '\n\tPattern not matched:'.red, '^.{1,11}$');                   return; }
-  if ( !/^(utf8(bom)?|ascii)$/.test(fileEncoding) ) { abort('Invalid option:', '--file-encoding',  '\n\tPattern not matched:'.red, '^(utf8(bom)?|ascii)$');        return; }
-  
-  const symins = await tse.getInstruments(true, false, 'Symbol');
-  let bom = '';
-  if (fileEncoding === 'utf8bom') {
-    bom = '\ufeff';
-    fileEncoding = undefined;
-  }
-  
-  files.forEach((file, i) => {
-    const sym = symbols[i];
-    const instrument = symins[sym];
-    const name = getFilename(fileName, instrument, priceAdjust);
-    writeFileSync(join(fileOutdir, name+'.'+fileExtension), bom+file, fileEncoding);
-  });
-} else {
-  log('\nNo symbols to process.'.redBold);
-}
 
-const { save, saveReset } = cmd;
-if (save) saveSettings(settings);
-if (saveReset) savedSettings(defaultSettings);
+  const { save, saveReset } = rawOpts;
+  if (save) saveSettings(settings);
+  if (saveReset) saveSettings(defaultSettings);
 
 })();
+
+async function intraday(args, subOpts) {
+  let inserr;
+  const instruments = await tse.getInstruments().catch(err => inserr = err);
+  if (inserr) { log('\nFatal Error #1:  '.red + inserr.title.red +'\n\n'+ inserr.detail.message.red); process.exitCode = 1; return; }
+  const allSymbols = instruments.map(i => i.Symbol);
+  
+  const _defaultSettings = defaultSettings.intraday;
+  const _savedSettings   = savedSettings.intraday;
+  
+  const gOpts = cmd.opts();
+  const symbols = resolveSymbols(allSymbols, savedSettings.symbols, instruments, {args, ...gOpts});
+  
+  const {
+    priceStartDate: startDate,
+    fileOutdir:     outdir,
+    fileName,
+    fileEncoding,
+    fileNoHeaders,
+    cache
+  } = gOpts;
+  const opts = { symbols, startDate, outdir, dirName: fileName, fileEncoding, fileHeaders: !fileNoHeaders, cache, ...subOpts };
+  Object.keys(opts).forEach(key => opts[key] === undefined && delete opts[key]);
+  
+  const settings = { ..._defaultSettings, ..._savedSettings, ...opts };
+  
+  log('Total symbols:'.grey, (symbols.length+'').yellow );
+  
+  if (symbols.length) {
+    const progress = new Progress(':bar :percent (Elapsed: :elapsed s)', {total: 100, width: 18, complete: '█', incomplete: '░', clear: true});
+    
+    const { gzip, outdir, cache, fileHeaders, altDate } = settings;
+    let { startDate, endDate, dirName, fileEncoding } = settings;
+    startDate = parseDateOption(startDate);
+    dirName   = +dirName;
+    
+    if (!startDate)                                   { abort('Invalid option:', '--start-date',    '\n\tPattern not matched:'.red, '^\\d{1,3}(y|m|d)$');       return; }
+    if (endDate) {
+      endDate = parseDateOption(endDate);
+      if (!endDate)                                   { abort('Invalid option:', '--end-date',      '\n\tPattern not matched:'.red, '^\\d{1,3}(y|m|d)$');       return; }
+      if (+endDate < +startDate)                      { abort('Invalid option:', '--end-date',      '\n\tCannot be less than'.red, '--start-date');             return; }
+    }
+    if ( !existsSync(outdir) ) mkdirSync(outdir);
+    if ( !statSync(outdir).isDirectory() )            { abort('Invalid option:', '--output-dir',    '\n\tPath is not a directory:'.red,  resolve(outdir).grey); return; }
+    if ( !/^[0-4]$/.test(''+dirName) )                { abort('Invalid option:', '--dir-name',      '\n\tPattern not matched:'.red, '^[0-4]$');                 return; }
+    if ( !/^(utf8(bom)?|ascii)$/.test(fileEncoding) ) { abort('Invalid option:', '--file-encoding', '\n\tPattern not matched:'.red, '^(utf8(bom)?|ascii)$');    return; }
+    
+    const _settings = {
+      startDate,
+      endDate,
+      cache,
+      gzip,
+      onprogress:    (n) => progress.tick(n - progress.curr),
+      progressTotal: 86
+    };
+    const { error, data } = await tse.getIntraday(symbols, _settings);
+    
+    let incompleteError, incompleteCount;
+    if (error) {
+      const { code, title } = error;
+      
+      process.exitCode = 1;
+      
+      if (code === 1 || code === 2) {
+        const fatal = ('\nFatal Error #'+code+':').red +'  '+ title.red +'\n\n';
+        
+        if (code === 1) {
+          const { detail } = error;
+          const msg = typeof detail === 'object' ? detail.message : detail;
+          log(fatal + msg.red);
+        } else if (code === 2) {
+          const { symbols } = error;
+          log(fatal + symbols.join('\n').red);
+        }
+        
+        return;
+        
+      } else if (code === 3 || code === 4) {
+        const { fails } = error;
+        
+        if (code === 3) {
+          incompleteCount = fails.length;
+          incompleteError = '\n'
+              + (title+':').redBold + '\n'
+              + fails.join('\n').red;
+          
+          fails.forEach(i => data[ symbols.indexOf(i) ] = undefined);
+          
+        } else if (code === 4) {
+          const syms = Object.keys(fails);
+          
+          incompleteCount = syms.length;
+          incompleteError = '\n'
+            + (title+':').redBold + '\n'
+            + syms.map(sym => sym +': '+ fails[sym].join(' ')).join('\n').red;
+        }
+      }
+    }
+    
+    const symins = await tse.getInstruments(true, false, 'Symbol');
+    let bom = '';
+    if (fileEncoding === 'utf8bom') {
+      bom = '\ufeff';
+      fileEncoding = undefined;
+    }
+    
+    const datalen = data.length;
+    const groupCols = tse.itdGroupCols;
+    const filenames = groupCols.map(i => i[0]);
+    
+    const shamsi = s => {
+      const { jy, jm, jd } = toJalaali(+s.slice(0,4), +s.slice(4,6), +s.slice(6,8));
+      return (jy*10000) + (jm*100) + jd + '';
+    };
+    
+    data.forEach((item, i) => {
+      if (!item || item.filter(i => i[1] === 'N/A').length === item.length) {
+        progress.tick(14/datalen);
+        return;
+      }
+      
+      const sym = symbols[i];
+      const instrument = symins[sym];
+      const name = safeWinFilename( getFilename(dirName, instrument) );
+      const dir = join(outdir, name);
+      if ( !existsSync(dir) ) mkdirSync(dir);
+      
+      if (gzip) {
+      
+        for (let [deven, content] of item) {
+          if (!content) continue;
+          if (altDate) deven = shamsi(''+deven);
+          writeFileSync(join(dir, ''+deven+'.csv.gz'), content);
+        }
+        
+      } else {
+        
+        for (let [deven, content] of item) {
+          if (!content || content === 'N/A') continue;
+          if (altDate) deven = shamsi(''+deven);
+          const idir = join(dir, ''+deven);
+          if ( !existsSync(idir) ) mkdirSync(idir);
+          
+          content.split('\n\n').forEach((v,j) => {
+            const headers = fileHeaders ? groupCols[j][1].join() + '\n' : '';
+            writeFileSync(join(idir, filenames[j] + '.csv'), bom+headers+v, fileEncoding);
+          });
+        }
+      
+      }
+      
+      progress.tick(14/datalen);
+    });
+    
+    
+    if (!progress.complete) progress.tick(progress.total - progress.curr);
+    
+    if (incompleteError) {
+      log((' √: '+(datalen - incompleteCount)).green + ('\n X: '+incompleteCount).red);
+      log(incompleteError);
+    } else {
+      log(' √'.green);
+    }
+  } else {
+    log('\nNo symbols to process.'.redBold);
+  }
+  
+  const { save, saveReset } = gOpts;
+  
+  if (save) {
+    savedSettings.intraday = settings;
+    saveSettings(savedSettings);
+  }
+  
+  if (saveReset) {
+    savedSettings.intraday = _defaultSettings;
+    saveSettings(savedSettings);
+  }
+}
+
 function resolveSymbols(allSymbols, savedSymbols=[], instruments, { args, symbol, symbolFile, symbolFilter, symbolDelete, symbolAll }) {
   if (symbolAll) return symbolDelete ? [] : allSymbols;
   
@@ -250,30 +463,6 @@ function resolveSymbols(allSymbols, savedSymbols=[], instruments, { args, symbol
   
   return finalSymbols;
 }
-function resolveSettings(symbols, defaults, saved, _cli) {
-  const {
-    priceColumns, priceAdjust, priceStartDate, priceDaysWithoutTrade,
-    fileOutdir, fileName, fileExtension, fileDelimiter, fileEncoding, fileNoHeaders: fileHeaders
-  } = _cli;
-  
-  const cli = {
-    symbols,
-    priceColumns,
-    priceAdjust,
-    priceStartDate,
-    priceDaysWithoutTrade,
-    fileOutdir,
-    fileName,
-    fileExtension,
-    fileDelimiter,
-    fileEncoding,
-    fileHeaders,
-  };
-  
-  Object.keys(cli).forEach(key => cli[key] === undefined && delete cli[key]);
-  
-  return { ...defaults, ...saved, ...cli };
-}
 function handleCacheDir(newdir) {
   if (typeof newdir === 'string') {
     tse.CACHE_DIR = newdir;
@@ -315,6 +504,28 @@ function parseColstr(str='') {
   });
   return res.filter(i=>!i).length ? undefined : res;
 }
+function parseDateOption(s) {
+  let result;
+  
+  const mindate = 20010321;
+  const relative = s.match(/^(\d{1,3})(y|m|d)$/);
+  
+  if (relative) {
+    const n = parseInt(relative[1], 10);
+    const m = ({y:'FullYear',m:'Month',d:'Date'})[ relative[2] ];
+    const d = new Date();
+    d['set'+m](d['get'+m]() - n);
+    d.setDate(d.getDate() - 1);
+    const res = (d.getFullYear()*10000) + ((d.getMonth()+1)*100) + d.getDate();
+    result = res < mindate ? ''+mindate : ''+res;
+  } else if (/^\d{8}$/.test(s)) {
+    const {gy,gm,gd} = toGregorian(+s.slice(0,4), +s.slice(4,6), +s.slice(6,8));
+    const res = (gy*10000) + (gm*100) + gd;
+    result = res < mindate ? ''+mindate : ''+res;
+  }
+  
+  return result;
+}
 function getFilterPredicate(filters) {
   const { flow, yval, csecval } = {flow:[], yval:[], csecval:[], ...filters};
   const [f,y,c] = [flow, yval, csecval].map(i => i.length);
@@ -330,6 +541,7 @@ function getFilterPredicate(filters) {
   return predicate;
 }
 function abort(m1, m2, ...rest) {
+  console.log('\n');
   console.log(m1.redBold, m2.whiteBold, ...rest);
   process.exitCode = 1;
   console.log('\naborted'.red);
@@ -359,6 +571,19 @@ function getFilename(filename, instrument, adjust) {
     instrument.Symbol + suffix(y, a, true); // instrument.CIsin + suffix(y, a)
   
   return str;
+}
+function safeWinFilename(str) {
+  return str
+    .replace('\\', ' ')
+    .replace('/', ' ')
+    .replace('*', ' ')
+    .replace(':', ' ')
+    .replace('>', ' ')
+    .replace('<', ' ')
+    .replace('?', ' ')
+    .replace('|', ' ')
+    .replace('^', ' ')
+    .replace('"', ' ');
 }
 function saveSettings(obj) {
   writeFileSync(join(__dirname,'settings.json'), JSON.stringify(obj, null, 2));
@@ -419,17 +644,32 @@ async function list(opts) {
     const selins = savedSettings.symbols.join('\n');
     log('\nSaved symbols:'.yellow);
     table( selins.length ? selins.yellowBold : 'none'.yellow );
+    
+    const selins2 = savedSettings.intraday.symbols.join('\n');
+    log('\nSaved intraday symbols:'.yellow);
+    table( selins2.length ? selins2.yellowBold : 'none'.yellow );
   }
   
   if (_savedSettings) {
     log('\nSaved settings:'.yellow);
-    const t = {...savedSettings};
-    delete t.symbols;
-    const o = {};
-    Object.keys(t).forEach(k => o[ '--'+k.replace(/([A-Z])/g, '-$1').toLowerCase() ] = t[k]);
-    table(o);
-    // const a = Object.keys(t).reduce((a,k)=> (a.push(['--'+k.replace(/([A-Z])/g, '-$1').toLowerCase(), t[k]]), a), []);
-    // printTable(a);
+    const a = {...savedSettings};
+    const b = a.intraday;
+    
+    delete a.symbols;
+    delete a.intraday;
+    
+    delete b.symbols;
+    
+    const [x, y] = [a, b].map(o => 
+      Object.keys(o).reduce((r, k) => (r[ '--'+k.replace(/([A-Z])/g, '-$1').toLowerCase() ] = o[k], r), {})
+    );
+    
+    table(x);
+    // const x1 = Object.keys(x).reduce((r,k)=> (r.push(['--'+k.replace(/([A-Z])/g, '-$1').toLowerCase(), x[k]]), r), []);
+    // printTable(x1);
+    
+    log('\nSaved intraday settings:'.yellow);
+    table(y);
   }
   
   if (allColumns) {
